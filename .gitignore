@@ -1,0 +1,11 @@
+build/
+managed_components/
+.vscode/
+
+main/project_local_config.private.h
+
+sdkconfig.old
+sdkconfig.local
+sdkconfig.local.defaults
+
+build_output.txt

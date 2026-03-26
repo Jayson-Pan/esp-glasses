@@ -1,0 +1,26 @@
+# This file was generated using idf.py save-defconfig. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) Project Minimal Configuration
+#
+CONFIG_BT_ENABLED=y
+# CONFIG_BT_BLE_50_FEATURES_SUPPORTED is not set
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+# CONFIG_BT_LE_50_FEATURE_SUPPORT is not used on ESP32, ESP32-C3 and ESP32-S3.
+# CONFIG_BT_LE_50_FEATURE_SUPPORT is not set
+
+# Flash configuration - 16MB flash size
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Custom partition table with larger app size
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Enable PSRAM (ESP32-S3: 8MB), Octal 80MHz
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# LVGL refresh period (aim ~60 FPS ceiling)
+CONFIG_LV_DISP_DEF_REFR_PERIOD=16
+CONFIG_LV_USE_USER_DATA=y
+CONFIG_LV_USE_CHART=y
+# CONFIG_LV_USE_PERF_MONITOR is not set
