@@ -11,13 +11,19 @@
 #include "LVGL_Driver.h"
 #include "ST7789.h"
 #include "LVGL_Example.h"
-#include "fonts/font_20.h"
-#include "fonts/nav_icon.h"
-#include "fonts/vehicle.h"
+#include "fonts/font_18.h"
 
 #define LVGL_TASK_DELAY_MS   10
 #define LVGL_TASK_STACK_SIZE 4096
 #define LVGL_TASK_PRIORITY   4
+
+#define UI_BG_COLOR_HEX          0x1A1A1A
+#define UI_DIVIDER_COLOR_HEX     0x4A4A4A
+#define UI_STATUS_BAR_WIDTH      30
+#define UI_DIVIDER_WIDTH         1
+#define UI_VISIBLE_CROP_TOP_DIV  4
+#define UI_DIALOG_GAP            6
+#define UI_TEXT_BUF_LEN          512
 
 static const char *TAG = "LVGL_UI";
 
@@ -29,24 +35,21 @@ static bool s_initialized = false;
 void lvgl_oled_lock(void);
 void lvgl_oled_unlock(void);
 
-static lv_obj_t *s_left_container = NULL;
-static lv_obj_t *s_right_container = NULL;
-static lv_obj_t *s_current_road_label = NULL;
-static lv_obj_t *s_nav_icon_label = NULL;
-static lv_obj_t *s_next_road_label = NULL;
-static lv_obj_t *s_remaining_dist_label = NULL;
-static lv_obj_t *s_next_dist_label = NULL;
-static lv_obj_t *s_vehicle_icon_label = NULL;
+static lv_obj_t *s_status_sidebar = NULL;
+static lv_obj_t *s_main_text_area = NULL;
+static lv_obj_t *s_dialog_label_top = NULL;
+static lv_obj_t *s_dialog_label_mid = NULL;
+static lv_obj_t *s_dialog_label_bottom = NULL;
 
-static const char *DEFAULT_CURRENT_ROAD = "当前道路";
-static const char *DEFAULT_NEXT_ROAD = "等待数据";
-static const char *DEFAULT_NEXT_DISTANCE = "---米";
-static const char *DEFAULT_REMAINING_DISTANCE = "---km";
+static const char *DEFAULT_DIALOG_TOP = "#8AB4F8 A:#你好!很高兴见到你,我们好久没见了.";
+static const char *DEFAULT_DIALOG_MID = "#FFD54F B:#是啊,很久了!这个眼镜真方便,可以实时看文字.";
+static const char *DEFAULT_DIALOG_BOTTOM = "#8AB4F8 A:#真的吗?那太好了,日常交流方便多了.";
 
 static void lvgl_task(void *param);
-static void create_navigation_ui(void);
+static void create_smart_glasses_demo_ui(void);
+static lv_obj_t *create_dialog_label(lv_obj_t *parent, lv_coord_t width, const char *text);
+static void normalize_punctuation_to_ascii(const char *src, char *dst, size_t dst_len);
 static void update_label_locked(lv_obj_t *label, const char *text, const char *fallback);
-static const char *get_nav_icon_symbol(int icon_type);
 static void format_distance(char *buf, size_t buf_len, int distance_meters);
 static bool ensure_mutex(void);
 
@@ -84,9 +87,10 @@ esp_err_t lvgl_oled_init(void)
     lvgl_oled_lock();
     lv_obj_t *scr = lv_disp_get_scr_act(s_disp);
     lv_obj_clean(scr);
-    lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
+    lv_obj_set_style_bg_color(scr, lv_color_hex(UI_BG_COLOR_HEX), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
-    create_navigation_ui();
+    /* 创建智能眼镜演示界面：左侧状态栏 + 右侧对话区 */
+    create_smart_glasses_demo_ui();
     /* 触发一次立即刷新，确保首帧覆盖整个屏幕，避免残留旧画面 */
     lv_timer_handler();
     lvgl_oled_unlock();
@@ -102,7 +106,7 @@ esp_err_t lvgl_oled_init(void)
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "LVGL 导航界面初始化完成");
+    ESP_LOGI(TAG, "LVGL 智能眼镜演示界面初始化完成");
     return ESP_OK;
 }
 
@@ -131,7 +135,7 @@ void lvgl_update_current_road(const char *road_name)
         return;
     }
     lvgl_oled_lock();
-    update_label_locked(s_current_road_label, road_name, DEFAULT_CURRENT_ROAD);
+    update_label_locked(s_dialog_label_top, road_name, DEFAULT_DIALOG_TOP);
     lvgl_oled_unlock();
 }
 
@@ -141,42 +145,41 @@ void lvgl_update_next_road(const char *road_name)
         return;
     }
     lvgl_oled_lock();
-    update_label_locked(s_next_road_label, road_name, DEFAULT_NEXT_ROAD);
-    lvgl_oled_unlock();
-}
-
-void lvgl_update_nav_icon(int icon_type)
-{
-    if (!s_initialized || s_nav_icon_label == NULL) {
-        return;
-    }
-    const char *symbol = get_nav_icon_symbol(icon_type);
-    lvgl_oled_lock();
-    lv_label_set_text(s_nav_icon_label, symbol);
+    update_label_locked(s_dialog_label_mid, road_name, DEFAULT_DIALOG_MID);
     lvgl_oled_unlock();
 }
 
 void lvgl_update_next_distance(int distance_meters)
 {
-    if (!s_initialized || s_next_dist_label == NULL) {
+    if (!s_initialized || s_dialog_label_mid == NULL) {
         return;
     }
-    char buf[16];
-    format_distance(buf, sizeof(buf), distance_meters);
+    char dist_buf[16];
+    char text_buf[64];
+    format_distance(dist_buf, sizeof(dist_buf), distance_meters);
+    snprintf(text_buf, sizeof(text_buf), "#FFD54F B:#下一个路口%s", dist_buf);
     lvgl_oled_lock();
-    lv_label_set_text(s_next_dist_label, buf);
+    lv_label_set_text(s_dialog_label_mid, text_buf);
     lvgl_oled_unlock();
 }
 
 void lvgl_update_remaining_distance(int distance_meters)
 {
-    if (!s_initialized || s_remaining_dist_label == NULL) {
+    if (!s_initialized) {
         return;
     }
-    char buf[16];
-    format_distance(buf, sizeof(buf), distance_meters);
+    char dist_buf[16];
+    char text_buf[64];
+    format_distance(dist_buf, sizeof(dist_buf), distance_meters);
+    snprintf(text_buf, sizeof(text_buf), "#8AB4F8 A:#剩余距离%s", dist_buf);
     lvgl_oled_lock();
-    lv_label_set_text(s_remaining_dist_label, buf);
+    if (s_dialog_label_bottom != NULL) {
+        lv_label_set_text(s_dialog_label_bottom, text_buf);
+    } else if (s_dialog_label_top != NULL) {
+        lv_label_set_text(s_dialog_label_top, text_buf);
+    } else if (s_dialog_label_mid != NULL) {
+        lv_label_set_text(s_dialog_label_mid, text_buf);
+    }
     lvgl_oled_unlock();
 }
 
@@ -186,12 +189,17 @@ void lvgl_update_text(const char *text)
         return;
     }
     lvgl_oled_lock();
-    update_label_locked(s_current_road_label, text, DEFAULT_CURRENT_ROAD);
+    if (s_dialog_label_bottom != NULL) {
+        update_label_locked(s_dialog_label_bottom, text, DEFAULT_DIALOG_BOTTOM);
+    } else {
+        update_label_locked(s_dialog_label_mid, text, DEFAULT_DIALOG_MID);
+    }
     lvgl_oled_unlock();
 }
 
 static void lvgl_task(void *param)
 {
+    (void)param;
     const TickType_t delay = pdMS_TO_TICKS(LVGL_TASK_DELAY_MS);
     while (true) {
         lvgl_oled_lock();
@@ -201,102 +209,188 @@ static void lvgl_task(void *param)
     }
 }
 
-static void create_navigation_ui(void)
+static lv_obj_t *create_dialog_label(lv_obj_t *parent, lv_coord_t width, const char *text)
 {
+    lv_obj_t *label = lv_label_create(parent);
+    lv_obj_set_width(label, width);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_label_set_recolor(label, true);
+    lv_obj_set_style_text_font(label, &font_18, 0);
+    lv_obj_set_style_text_color(label, lv_color_white(), 0);
+    lv_obj_set_style_text_line_space(label, 3, 0);
+    lv_label_set_text(label, text);
+    return label;
+}
+
+static void create_smart_glasses_demo_ui(void)
+{
+    lv_obj_t *scr = lv_disp_get_scr_act(s_disp);
     lv_coord_t width = lv_disp_get_hor_res(s_disp);
     lv_coord_t height = lv_disp_get_ver_res(s_disp);
 
-    lv_coord_t left_width = width / 2 - 1;
-    if (left_width < 0) {
-        left_width = width;
-    }
-    lv_coord_t right_width = width - left_width - 2;
-    if (right_width < 0) {
-        right_width = width / 2;
+    lv_coord_t visible_top = height / UI_VISIBLE_CROP_TOP_DIV;
+    lv_coord_t visible_height = height - visible_top;
+    if (visible_height < 60) {
+        visible_top = 0;
+        visible_height = height;
     }
 
-    s_left_container = lv_obj_create(lv_disp_get_scr_act(s_disp));
-    lv_obj_remove_style_all(s_left_container);
-    lv_obj_set_size(s_left_container, left_width, height);
-    lv_obj_set_pos(s_left_container, 0, 0);
-    lv_obj_set_style_bg_opa(s_left_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_left_container, 1, 0);
-    lv_obj_set_style_border_color(s_left_container, lv_color_white(), 0);
-    lv_obj_set_style_pad_all(s_left_container, 6, 0);
-    lv_obj_set_style_pad_gap(s_left_container, 14, 0);
-    lv_obj_set_style_pad_top(s_left_container, 16, 0);
-    lv_obj_set_style_pad_bottom(s_left_container, 16, 0);
-    lv_obj_set_style_text_color(s_left_container, lv_color_white(), 0);
-    lv_obj_set_flex_flow(s_left_container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(s_left_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_coord_t status_width = UI_STATUS_BAR_WIDTH;
+    if (status_width > width - 80) {
+        status_width = width / 6;
+    }
+    if (status_width < 20) {
+        status_width = 20;
+    }
 
-    s_next_road_label = lv_label_create(s_left_container);
-    lv_label_set_text(s_next_road_label, DEFAULT_NEXT_ROAD);
-    lv_obj_set_width(s_next_road_label, LV_PCT(100));
-    lv_label_set_long_mode(s_next_road_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_font(s_next_road_label, &font_20, 0);
-    lv_obj_set_style_text_align(s_next_road_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_coord_t divider_width = UI_DIVIDER_WIDTH;
+    lv_coord_t main_width = width - status_width - divider_width;
+    if (main_width < 60) {
+        main_width = width - status_width;
+        divider_width = 0;
+    }
 
-    s_nav_icon_label = lv_label_create(s_left_container);
-    lv_label_set_text(s_nav_icon_label, ICON_FORWARD);
-    lv_obj_set_width(s_nav_icon_label, LV_PCT(100));
-    lv_obj_set_style_text_font(s_nav_icon_label, &nav_icon, 0);
-    lv_obj_set_style_text_align(s_nav_icon_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_coord_t dialog_text_width = main_width - 8;
+    if (dialog_text_width < 60) {
+        dialog_text_width = main_width;
+    }
 
-    s_current_road_label = lv_label_create(s_left_container);
-    lv_label_set_text(s_current_road_label, DEFAULT_CURRENT_ROAD);
-    lv_obj_set_width(s_current_road_label, LV_PCT(100));
-    lv_label_set_long_mode(s_current_road_label, LV_LABEL_LONG_SCROLL_CIRCULAR);
-    lv_obj_set_style_text_font(s_current_road_label, &font_20, 0);
-    lv_obj_set_style_text_align(s_current_road_label, LV_TEXT_ALIGN_CENTER, 0);
+    /* 左侧状态栏：与可视窗等高，保证图标落在棱镜中心可见区域 */
+    s_status_sidebar = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_status_sidebar);
+    lv_obj_set_size(s_status_sidebar, status_width, visible_height);
+    lv_obj_set_pos(s_status_sidebar, 0, visible_top);
+    lv_obj_set_style_bg_opa(s_status_sidebar, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_pad_all(s_status_sidebar, 0, 0);
+    lv_obj_set_flex_flow(s_status_sidebar, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_status_sidebar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-    s_right_container = lv_obj_create(lv_disp_get_scr_act(s_disp));
-    lv_obj_remove_style_all(s_right_container);
-    lv_obj_set_size(s_right_container, right_width, height);
-    lv_obj_set_pos(s_right_container, left_width + 2, 0);
-    lv_obj_set_style_bg_opa(s_right_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(s_right_container, 1, 0);
-    lv_obj_set_style_border_color(s_right_container, lv_color_white(), 0);
-    lv_obj_set_style_pad_all(s_right_container, 6, 0);
-    lv_obj_set_style_pad_gap(s_right_container, 16, 0);
-    lv_obj_set_style_pad_top(s_right_container, 16, 0);
-    lv_obj_set_style_pad_bottom(s_right_container, 16, 0);
-    lv_obj_set_style_text_color(s_right_container, lv_color_white(), 0);
-    lv_obj_set_flex_flow(s_right_container, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_flex_align(s_right_container, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_t *icon_bt = lv_label_create(s_status_sidebar);
+    lv_label_set_text(icon_bt, LV_SYMBOL_BLUETOOTH);
+    lv_obj_set_style_text_color(icon_bt, lv_color_hex(0x8AB4F8), 0);
 
-    s_remaining_dist_label = lv_label_create(s_right_container);
-    lv_label_set_text(s_remaining_dist_label, DEFAULT_REMAINING_DISTANCE);
-    lv_obj_set_width(s_remaining_dist_label, LV_PCT(100));
-    lv_obj_set_style_text_font(s_remaining_dist_label, &font_20, 0);
-    lv_obj_set_style_text_align(s_remaining_dist_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_t *icon_battery = lv_label_create(s_status_sidebar);
+    lv_label_set_text(icon_battery, LV_SYMBOL_BATTERY_FULL);
+    lv_obj_set_style_text_color(icon_battery, lv_color_white(), 0);
 
-    /* 车辆图标，初始隐藏（空文本） */
-    s_vehicle_icon_label = lv_label_create(s_right_container);
-    lv_obj_set_width(s_vehicle_icon_label, LV_PCT(100));
-    lv_obj_set_style_text_font(s_vehicle_icon_label, &vehicle, 0);
-    lv_obj_set_style_text_align(s_vehicle_icon_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_text(s_vehicle_icon_label, "");
+    lv_obj_t *icon_audio = lv_label_create(s_status_sidebar);
+    lv_label_set_text(icon_audio, LV_SYMBOL_AUDIO);
+    lv_obj_set_style_text_color(icon_audio, lv_color_white(), 0);
 
-    s_next_dist_label = lv_label_create(s_right_container);
-    lv_label_set_text(s_next_dist_label, DEFAULT_NEXT_DISTANCE);
-    lv_obj_set_width(s_next_dist_label, LV_PCT(100));
-    lv_obj_set_style_text_font(s_next_dist_label, &font_20, 0);
-    lv_obj_set_style_text_align(s_next_dist_label, LV_TEXT_ALIGN_CENTER, 0);
+    /* 分割线：只覆盖可视窗高度 */
+    if (divider_width > 0) {
+        lv_obj_t *divider = lv_obj_create(scr);
+        lv_obj_remove_style_all(divider);
+        lv_obj_set_size(divider, divider_width, visible_height);
+        lv_obj_set_pos(divider, status_width, visible_top);
+        lv_obj_set_style_bg_color(divider, lv_color_hex(UI_DIVIDER_COLOR_HEX), 0);
+        lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
+    }
+
+    /* 右侧主文本区：限定在中间可视窗，仅放两句 A/B */
+    s_main_text_area = lv_obj_create(scr);
+    lv_obj_remove_style_all(s_main_text_area);
+    lv_obj_set_size(s_main_text_area, main_width, visible_height);
+    lv_obj_set_pos(s_main_text_area, status_width + divider_width, visible_top);
+    lv_obj_set_style_bg_opa(s_main_text_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(s_main_text_area, lv_color_white(), 0);
+    lv_obj_set_style_pad_top(s_main_text_area, 4, 0);
+    lv_obj_set_style_pad_bottom(s_main_text_area, 4, 0);
+    lv_obj_set_style_pad_left(s_main_text_area, 6, 0);
+    lv_obj_set_style_pad_right(s_main_text_area, 4, 0);
+    lv_obj_set_style_pad_gap(s_main_text_area, UI_DIALOG_GAP, 0);
+    lv_obj_set_flex_flow(s_main_text_area, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_main_text_area, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+
+    s_dialog_label_top = create_dialog_label(s_main_text_area, dialog_text_width, DEFAULT_DIALOG_TOP);
+    s_dialog_label_mid = create_dialog_label(s_main_text_area, dialog_text_width, DEFAULT_DIALOG_MID);
+    s_dialog_label_bottom = NULL;
+
+    ESP_LOGI(TAG, "UI布局: %dx%d, 可视窗Y:%d H:%d, 侧边栏:%d, 主区:%d, 文本宽:%d",
+             (int)width, (int)height, (int)visible_top, (int)visible_height,
+             (int)status_width, (int)main_width, (int)dialog_text_width);
 }
 
 static void update_label_locked(lv_obj_t *label, const char *text, const char *fallback)
 {
+    static char normalized_buf[UI_TEXT_BUF_LEN];
+    const char *src = NULL;
+
     if (label == NULL) {
         return;
     }
+
     if (text != NULL && text[0] != '\0') {
-        lv_label_set_text(label, text);
+        src = text;
     } else if (fallback != NULL) {
-        lv_label_set_text(label, fallback);
+        src = fallback;
     } else {
         lv_label_set_text(label, "");
+        return;
     }
+
+    normalize_punctuation_to_ascii(src, normalized_buf, sizeof(normalized_buf));
+    lv_label_set_text(label, normalized_buf);
+}
+
+static void normalize_punctuation_to_ascii(const char *src, char *dst, size_t dst_len)
+{
+    size_t di = 0;
+
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    while (*src != '\0' && di + 1 < dst_len) {
+        const unsigned char c0 = (unsigned char)src[0];
+        const unsigned char c1 = (unsigned char)src[1];
+        const unsigned char c2 = (unsigned char)src[2];
+
+        /* 常用全角标点转半角，规避字库缺失导致的乱码 */
+        if (c0 == 0xEF && c1 != 0 && c2 != 0 && c1 == 0xBC) {
+            char repl = '\0';
+            if (c2 == 0x8C) {
+                repl = ','; /* ， U+FF0C */
+            } else if (c2 == 0x81) {
+                repl = '!'; /* ！ U+FF01 */
+            } else if (c2 == 0x9F) {
+                repl = '?'; /* ？ U+FF1F */
+            } else if (c2 == 0x9A) {
+                repl = ':'; /* ： U+FF1A */
+            } else if (c2 == 0x9B) {
+                repl = ';'; /* ； U+FF1B */
+            }
+
+            if (repl != '\0') {
+                dst[di++] = repl;
+                src += 3;
+                continue;
+            }
+        }
+
+        if (c0 == 0xE3 && c1 != 0 && c2 != 0 && c1 == 0x80) {
+            if (c2 == 0x82) {
+                dst[di++] = '.'; /* 。 U+3002 */
+                src += 3;
+                continue;
+            }
+
+            if (c2 == 0x81) {
+                dst[di++] = ','; /* 、 U+3001 */
+                src += 3;
+                continue;
+            }
+        }
+
+        dst[di++] = *src++;
+    }
+
+    dst[di] = '\0';
 }
 
 static void format_distance(char *buf, size_t buf_len, int distance_meters)
@@ -311,38 +405,5 @@ static void format_distance(char *buf, size_t buf_len, int distance_meters)
     } else {
         snprintf(buf, buf_len, "%dm", distance_meters);
     }
-}
-
-static const char *get_nav_icon_symbol(int icon_type)
-{
-    switch (icon_type) {
-        case 2:  return ICON_LEFT;
-        case 3:  return ICON_RIGHT;
-        case 4:  return ICON_FRONT_LEFT;
-        case 5:  return ICON_FRONT_RIGHT;
-        case 6:  return ICON_REAR_LEFT;
-        case 7:  return ICON_REAR_RIGHT;
-        case 9:  return ICON_FORWARD;
-        case 15: return ICON_END;
-        default: return ICON_FORWARD;
-    }
-}
-
-/* UTF-8 of U+E606 (默认 CAR 图标) */
-/* 默认车辆图标（CAR） */
-#define VEHICLE_CAR_SYMBOL CAR
-
-void lvgl_set_vehicle_detect(bool detected)
-{
-    if (!s_initialized || s_vehicle_icon_label == NULL) {
-        return;
-    }
-    lvgl_oled_lock();
-    if (detected) {
-        lv_label_set_text(s_vehicle_icon_label, VEHICLE_CAR_SYMBOL);
-    } else {
-        lv_label_set_text(s_vehicle_icon_label, "");
-    }
-    lvgl_oled_unlock();
 }
 

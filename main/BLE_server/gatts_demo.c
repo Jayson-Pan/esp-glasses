@@ -34,9 +34,7 @@
 #include "esp_gatt_common_api.h"
 
 #include "sdkconfig.h"
-#include "nav_parser.h"
 #include "wifi_connect.h"
-#include "micro_ros_sub.h"
 #include "LVGL_UI/LVGL_Example.h"
 
 #define GATTS_TAG "GATTS_DEMO"
@@ -426,7 +424,7 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
             ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
             ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
             
-            // 处理特征值写入 - 接收手机发送的文本格式数据包(N1/N2/D)
+            // 处理特征值写入 - 直接将蓝牙文本显示到屏幕
             if (gl_profile_tab[PROFILE_A_APP_ID].char_handle == param->write.handle) {
                 // 创建null结尾的字符串
                 char text_str[param->write.len + 1];
@@ -438,31 +436,8 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
                 ESP_LOGI(GATTS_TAG, "长度: %d 字节", param->write.len);
                 ESP_LOGI(GATTS_TAG, "内容: %s", text_str);
                 ESP_LOGI(GATTS_TAG, "========================================");
-                
-                // 解析文本数据包
-                nav_packet_t packet;
-                if (nav_parser_parse_text(text_str, &packet)) {
-                    ESP_LOGI(GATTS_TAG, "数据包解析成功! (Profile A)");
-                    nav_parser_print_packet(&packet);
-                    
-                    // 根据包类型更新OLED显示
-                    if (packet.type == NAV_PACKET_TYPE_N1) {
-                        // N1包: 更新当前道路和转向图标
-                        lvgl_update_current_road(packet.data.n1.current_road);
-                        lvgl_update_nav_icon(packet.data.n1.icon_type);
-                    } 
-                    else if (packet.type == NAV_PACKET_TYPE_N2) {
-                        // N2包: 更新下一道路
-                        lvgl_update_next_road(packet.data.n2.next_road);
-                    }
-                    else if (packet.type == NAV_PACKET_TYPE_D) {
-                        // D包: 更新距离信息
-                        lvgl_update_next_distance(packet.data.d.distance_to_next);
-                        lvgl_update_remaining_distance(packet.data.d.distance_to_dest);
-                    }
-                } else {
-                    ESP_LOGE(GATTS_TAG, "数据包解析失败! (Profile A)");
-                }
+
+                lvgl_update_text(text_str);
             }
             
             // 处理描述符写入 - 启用/禁用通知
@@ -640,7 +615,7 @@ static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
             ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
             ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
             
-            // 处理特征值写入 - 接收手机发送的文本格式数据包(N1/N2/D) (Profile B)
+            // 处理特征值写入 - 直接将蓝牙文本显示到屏幕 (Profile B)
             if (gl_profile_tab[PROFILE_B_APP_ID].char_handle == param->write.handle) {
                 // 创建null结尾的字符串
                 char text_str[param->write.len + 1];
@@ -652,31 +627,8 @@ static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
                 ESP_LOGI(GATTS_TAG, "长度: %d 字节", param->write.len);
                 ESP_LOGI(GATTS_TAG, "内容: %s", text_str);
                 ESP_LOGI(GATTS_TAG, "========================================");
-                
-                // 解析文本数据包
-                nav_packet_t packet;
-                if (nav_parser_parse_text(text_str, &packet)) {
-                    ESP_LOGI(GATTS_TAG, "数据包解析成功! (Profile B)");
-                    nav_parser_print_packet(&packet);
-                    
-                    // 根据包类型更新OLED显示
-                    if (packet.type == NAV_PACKET_TYPE_N1) {
-                        // N1包: 更新当前道路和转向图标
-                        lvgl_update_current_road(packet.data.n1.current_road);
-                        lvgl_update_nav_icon(packet.data.n1.icon_type);
-                    } 
-                    else if (packet.type == NAV_PACKET_TYPE_N2) {
-                        // N2包: 更新下一道路
-                        lvgl_update_next_road(packet.data.n2.next_road);
-                    }
-                    else if (packet.type == NAV_PACKET_TYPE_D) {
-                        // D包: 更新距离信息
-                        lvgl_update_next_distance(packet.data.d.distance_to_next);
-                        lvgl_update_remaining_distance(packet.data.d.distance_to_dest);
-                    }
-                } else {
-                    ESP_LOGE(GATTS_TAG, "数据包解析失败! (Profile B)");
-                }
+
+                lvgl_update_text(text_str);
             }
             
             // 处理描述符写入 - 启用/禁用通知
@@ -841,15 +793,6 @@ void app_main(void)
         // 继续运行BLE功能,即使WiFi连接失败
     } else {
         ESP_LOGI(GATTS_TAG, "WiFi connection established successfully");
-        
-        // 启动 micro-ROS 订阅节点
-        ESP_LOGI(GATTS_TAG, "Starting micro-ROS subscriber...");
-        ret = micro_ros_subscriber_start();
-        if (ret != ESP_OK) {
-            ESP_LOGE(GATTS_TAG, "micro-ROS subscriber start failed: %s", esp_err_to_name(ret));
-        } else {
-            ESP_LOGI(GATTS_TAG, "micro-ROS subscriber started successfully");
-        }
     }
 
     // 初始化LVGL和OLED显示屏
