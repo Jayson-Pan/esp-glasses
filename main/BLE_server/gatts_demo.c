@@ -19,8 +19,8 @@
 #include <string.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
-#include "freertos/event_groups.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
@@ -35,7 +35,6 @@
 #include "cJSON.h"
 
 #include "sdkconfig.h"
-#include "wifi_connect.h"
 #include "LVGL_UI/LVGL_Example.h"
 
 #define GATTS_TAG "GATTS_DEMO"
@@ -205,6 +204,9 @@ static prepare_type_env_t b_prepare_write_env;
 #define CAPTION_SESSION_ID_MAX_LEN    96
 #define CAPTION_LINE_ID_MAX_LEN       96
 #define CAPTION_TEXT_MAX_LEN          512
+#define CAPTION_WORK_QUEUE_LEN        4
+#define CAPTION_WORKER_STACK_SIZE     6144
+#define CAPTION_WORKER_TASK_PRIORITY  5
 
 typedef struct {
     bool active;
@@ -222,6 +224,11 @@ typedef struct {
     char live_text[CAPTION_TEXT_MAX_LEN];
 } caption_state_t;
 
+typedef struct {
+    size_t length;
+    char line[CAPTION_RX_BUFFER_SIZE];
+} caption_work_item_t;
+
 static caption_rx_buffer_t s_caption_rx = {
     .active = false,
     .conn_id = 0,
@@ -238,16 +245,37 @@ static caption_state_t s_caption_state = {
     .live_text = {0},
 };
 
+static QueueHandle_t s_caption_work_queue = NULL;
+static TaskHandle_t s_caption_worker_task_handle = NULL;
+static caption_work_item_t s_caption_queue_item = {
+    .length = 0,
+    .line = {0},
+};
+static caption_work_item_t s_caption_drop_item = {
+    .length = 0,
+    .line = {0},
+};
+
 void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
 void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
+static esp_err_t caption_worker_init(void);
+static void caption_worker_task(void *param);
 static void caption_reset_rx_buffer(uint16_t conn_id);
 static void caption_reset_state(bool clear_session);
+static bool caption_enqueue_line(const char *line);
+static void caption_dispatch_line(const char *line);
 static void caption_consume_write_data(uint16_t conn_id, const uint8_t *data, size_t len);
 static void caption_handle_json_line(const char *line);
+static void caption_handle_plain_text_line(const char *line);
 static void caption_copy_string(char *dst, size_t dst_len, const char *src);
 static void caption_build_display_text(char *dst, size_t dst_len, const char *speaker_label, const char *text);
 static const char *caption_json_get_string(cJSON *root, const char *key);
+static const char *caption_json_get_string_multi(cJSON *root, const char **keys, size_t key_count);
 static int caption_json_get_int(cJSON *root, const char *key, int fallback);
+static bool caption_handle_simple_json(cJSON *root);
+static void caption_trim_ascii(char *text);
+static bool caption_parse_plain_text_message(const char *line, char *speaker, size_t speaker_len, char *text, size_t text_len);
+static bool caption_is_complete_json_text(const char *line);
 static void caption_handle_characteristic_write(esp_ble_gatts_cb_param_t *param, uint16_t char_handle, const char *profile_name);
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
@@ -363,7 +391,19 @@ void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare
 
 void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param){
     if (param->exec_write.exec_write_flag == ESP_GATT_PREP_WRITE_EXEC){
-        ESP_LOG_BUFFER_HEX(GATTS_TAG, prepare_write_env->prepare_buf, prepare_write_env->prepare_len);
+        ESP_LOGI(GATTS_TAG, "Execute prepared write, len=%d", prepare_write_env->prepare_len);
+        if (prepare_write_env->prepare_buf != NULL && prepare_write_env->prepare_len > 0) {
+            if (memchr(prepare_write_env->prepare_buf, '\0', (size_t)prepare_write_env->prepare_len) == NULL) {
+                caption_consume_write_data(
+                    param->exec_write.conn_id,
+                    prepare_write_env->prepare_buf,
+                    (size_t)prepare_write_env->prepare_len);
+            } else {
+                ESP_LOGW(GATTS_TAG,
+                         "Prepared Write 数据包含空字节，按非文本数据忽略: len=%d",
+                         prepare_write_env->prepare_len);
+            }
+        }
     }else{
         ESP_LOGI(GATTS_TAG,"Prepare write cancel");
     }
@@ -404,6 +444,57 @@ static void caption_reset_state(bool clear_session)
     }
 }
 
+static esp_err_t caption_worker_init(void)
+{
+    if (s_caption_work_queue != NULL && s_caption_worker_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    s_caption_work_queue = xQueueCreate(CAPTION_WORK_QUEUE_LEN, sizeof(caption_work_item_t));
+    if (s_caption_work_queue == NULL) {
+        ESP_LOGE(GATTS_TAG, "创建字幕工作队列失败");
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t task_ret = xTaskCreate(
+        caption_worker_task,
+        "caption_worker",
+        CAPTION_WORKER_STACK_SIZE,
+        NULL,
+        CAPTION_WORKER_TASK_PRIORITY,
+        &s_caption_worker_task_handle);
+    if (task_ret != pdPASS) {
+        ESP_LOGE(GATTS_TAG, "创建字幕工作任务失败");
+        vQueueDelete(s_caption_work_queue);
+        s_caption_work_queue = NULL;
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(GATTS_TAG,
+             "字幕工作任务已启动: queue_len=%u stack=%u",
+             (unsigned int)CAPTION_WORK_QUEUE_LEN,
+             (unsigned int)CAPTION_WORKER_STACK_SIZE);
+    return ESP_OK;
+}
+
+static void caption_worker_task(void *param)
+{
+    caption_work_item_t item;
+    (void)param;
+
+    for (;;) {
+        if (xQueueReceive(s_caption_work_queue, &item, portMAX_DELAY) != pdPASS) {
+            continue;
+        }
+
+        if (item.length >= sizeof(item.line)) {
+            item.length = sizeof(item.line) - 1;
+        }
+        item.line[item.length] = '\0';
+        caption_handle_json_line(item.line);
+    }
+}
+
 static void caption_copy_string(char *dst, size_t dst_len, const char *src)
 {
     if (dst == NULL || dst_len == 0) {
@@ -438,12 +529,68 @@ static void caption_build_display_text(
     }
 }
 
+static bool caption_enqueue_line(const char *line)
+{
+    if (line == NULL || line[0] == '\0') {
+        return false;
+    }
+
+    if (s_caption_work_queue == NULL) {
+        ESP_LOGE(GATTS_TAG, "字幕工作队列未初始化，丢弃消息");
+        return false;
+    }
+
+    caption_copy_string(s_caption_queue_item.line, sizeof(s_caption_queue_item.line), line);
+    s_caption_queue_item.length = strlen(s_caption_queue_item.line);
+
+    if (xQueueSend(s_caption_work_queue, &s_caption_queue_item, 0) == pdPASS) {
+        return true;
+    }
+
+    if (xQueueReceive(s_caption_work_queue, &s_caption_drop_item, 0) == pdPASS) {
+        ESP_LOGW(GATTS_TAG,
+                 "字幕队列已满，丢弃最旧消息: len=%u",
+                 (unsigned int)s_caption_drop_item.length);
+        if (xQueueSend(s_caption_work_queue, &s_caption_queue_item, 0) == pdPASS) {
+            return true;
+        }
+    }
+
+    ESP_LOGW(GATTS_TAG,
+             "字幕队列繁忙，丢弃新消息: len=%u",
+             (unsigned int)s_caption_queue_item.length);
+    return false;
+}
+
+static void caption_dispatch_line(const char *line)
+{
+    if (!caption_enqueue_line(line)) {
+        ESP_LOGW(GATTS_TAG, "字幕消息入队失败");
+    }
+}
+
 static const char *caption_json_get_string(cJSON *root, const char *key)
 {
     cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
     if (cJSON_IsString(item) && item->valuestring != NULL) {
         return item->valuestring;
     }
+    return NULL;
+}
+
+static const char *caption_json_get_string_multi(cJSON *root, const char **keys, size_t key_count)
+{
+    if (keys == NULL || key_count == 0) {
+        return NULL;
+    }
+
+    for (size_t i = 0; i < key_count; ++i) {
+        const char *value = caption_json_get_string(root, keys[i]);
+        if (value != NULL && value[0] != '\0') {
+            return value;
+        }
+    }
+
     return NULL;
 }
 
@@ -456,6 +603,178 @@ static int caption_json_get_int(cJSON *root, const char *key, int fallback)
     return fallback;
 }
 
+static void caption_trim_ascii(char *text)
+{
+    size_t start = 0;
+    size_t end;
+
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+
+    end = strlen(text);
+
+    while (start < end && (text[start] == ' ' || text[start] == '\t' || text[start] == '\r' || text[start] == '\n')) {
+        start++;
+    }
+
+    while (end > start && (text[end - 1] == ' ' || text[end - 1] == '\t' || text[end - 1] == '\r' || text[end - 1] == '\n')) {
+        end--;
+    }
+
+    if (start > 0) {
+        memmove(text, text + start, end - start);
+    }
+    text[end - start] = '\0';
+}
+
+static bool caption_parse_plain_text_message(
+    const char *line,
+    char *speaker,
+    size_t speaker_len,
+    char *text,
+    size_t text_len)
+{
+    char line_buf[CAPTION_TEXT_MAX_LEN];
+    size_t len;
+
+    if (line == NULL || text == NULL || text_len == 0) {
+        return false;
+    }
+
+    if (speaker != NULL && speaker_len > 0) {
+        speaker[0] = '\0';
+    }
+
+    caption_copy_string(line_buf, sizeof(line_buf), line);
+    caption_trim_ascii(line_buf);
+    if (line_buf[0] == '\0') {
+        return false;
+    }
+
+    len = strlen(line_buf);
+    if (line_buf[0] == '{' && line_buf[len - 1] == '}') {
+        return false;
+    }
+
+    for (size_t i = 1; i < len; ++i) {
+        if (line_buf[i] != '|' && line_buf[i] != ':') {
+            continue;
+        }
+        if (i > 32) {
+            continue;
+        }
+
+        line_buf[i] = '\0';
+        char *left = line_buf;
+        char *right = line_buf + i + 1;
+        caption_trim_ascii(left);
+        caption_trim_ascii(right);
+
+        if (left[0] == '\0' || right[0] == '\0') {
+            continue;
+        }
+
+        if (speaker != NULL && speaker_len > 0) {
+            caption_copy_string(speaker, speaker_len, left);
+        }
+        caption_copy_string(text, text_len, right);
+        return true;
+    }
+
+    caption_copy_string(text, text_len, line_buf);
+    return text[0] != '\0';
+}
+
+static void caption_handle_plain_text_line(const char *line)
+{
+    char speaker[CAPTION_LINE_ID_MAX_LEN];
+    char text[CAPTION_TEXT_MAX_LEN];
+    char display_text[CAPTION_TEXT_MAX_LEN];
+
+    if (!caption_parse_plain_text_message(line, speaker, sizeof(speaker), text, sizeof(text))) {
+        ESP_LOGW(GATTS_TAG, "忽略无法解析的纯文本消息: %s", line == NULL ? "<null>" : line);
+        return;
+    }
+
+    caption_build_display_text(
+        display_text,
+        sizeof(display_text),
+        speaker[0] == '\0' ? NULL : speaker,
+        text);
+
+    caption_copy_string(s_caption_state.live_text, sizeof(s_caption_state.live_text), display_text);
+    ESP_LOGI(GATTS_TAG,
+             "应用纯文本实时字幕: speaker=%s text=%s",
+             speaker[0] == '\0' ? "<none>" : speaker,
+             s_caption_state.live_text);
+    lvgl_caption_set_live(s_caption_state.live_text);
+}
+
+static bool caption_handle_simple_json(cJSON *root)
+{
+    static const char *speaker_keys[] = {"speakerLabel", "speaker", "speakerName", "speakerId"};
+    static const char *text_keys[] = {"text", "content", "message", "caption"};
+    const char *speaker_label;
+    const char *text;
+    cJSON *is_final_item;
+    bool is_final = false;
+    char display_text[CAPTION_TEXT_MAX_LEN];
+
+    if (root == NULL) {
+        return false;
+    }
+
+    speaker_label = caption_json_get_string_multi(root, speaker_keys, sizeof(speaker_keys) / sizeof(speaker_keys[0]));
+    text = caption_json_get_string_multi(root, text_keys, sizeof(text_keys) / sizeof(text_keys[0]));
+    if (text == NULL || text[0] == '\0') {
+        return false;
+    }
+
+    is_final_item = cJSON_GetObjectItemCaseSensitive(root, "isFinal");
+    if (cJSON_IsBool(is_final_item)) {
+        is_final = cJSON_IsTrue(is_final_item);
+    } else if (cJSON_IsNumber(is_final_item)) {
+        is_final = is_final_item->valueint != 0;
+    }
+
+    caption_build_display_text(display_text, sizeof(display_text), speaker_label, text);
+
+    if (is_final) {
+        caption_copy_string(s_caption_state.committed_text, sizeof(s_caption_state.committed_text), display_text);
+        s_caption_state.live_text[0] = '\0';
+        ESP_LOGI(GATTS_TAG, "应用简化JSON定稿字幕: %s", s_caption_state.committed_text);
+        lvgl_caption_set_committed(s_caption_state.committed_text);
+        lvgl_caption_clear_live();
+    } else {
+        caption_copy_string(s_caption_state.live_text, sizeof(s_caption_state.live_text), display_text);
+        ESP_LOGI(GATTS_TAG, "应用简化JSON实时字幕: %s", s_caption_state.live_text);
+        lvgl_caption_set_live(s_caption_state.live_text);
+    }
+
+    return true;
+}
+
+static bool caption_is_complete_json_text(const char *line)
+{
+    size_t start = 0;
+    size_t end;
+
+    if (line == NULL) {
+        return false;
+    }
+
+    end = strlen(line);
+    while (start < end && (line[start] == ' ' || line[start] == '\t' || line[start] == '\r' || line[start] == '\n')) {
+        start++;
+    }
+    while (end > start && (line[end - 1] == ' ' || line[end - 1] == '\t' || line[end - 1] == '\r' || line[end - 1] == '\n')) {
+        end--;
+    }
+
+    return end > start && line[start] == '{' && line[end - 1] == '}';
+}
+
 static void caption_handle_json_line(const char *line)
 {
     if (line == NULL || line[0] == '\0') {
@@ -463,14 +782,14 @@ static void caption_handle_json_line(const char *line)
         return;
     }
 
-    ESP_LOGI(GATTS_TAG, "收到完整字幕消息行: len=%u, raw=%s",
-             (unsigned int)strlen(line), line);
+    ESP_LOGI(GATTS_TAG, "收到完整字幕消息: len=%u",
+             (unsigned int)strlen(line));
     cJSON *root = cJSON_Parse(line);
     if (root == NULL) {
         const char *error_ptr = cJSON_GetErrorPtr();
-        ESP_LOGE(GATTS_TAG, "字幕协议解析失败: error_at=%s raw=%s",
-                 error_ptr == NULL ? "<unknown>" : error_ptr,
-                 line);
+        ESP_LOGW(GATTS_TAG, "按JSON解析失败，回退为纯文本: error_at=%s",
+                 error_ptr == NULL ? "<unknown>" : error_ptr);
+        caption_handle_plain_text_line(line);
         return;
     }
 
@@ -479,12 +798,14 @@ static void caption_handle_json_line(const char *line)
     const int seq = caption_json_get_int(root, "seq", -1);
 
     if (type == NULL || session_id == NULL || seq < 0) {
-        ESP_LOGE(GATTS_TAG,
-                 "字幕协议缺少必要字段: type=%s sessionId=%s seq=%d raw=%s",
-                 type == NULL ? "<null>" : type,
-                 session_id == NULL ? "<null>" : session_id,
-                 seq,
-                 line);
+        if (!caption_handle_simple_json(root)) {
+            ESP_LOGW(GATTS_TAG,
+                     "字幕协议缺少必要字段且不属于简化JSON: type=%s sessionId=%s seq=%d raw=%s",
+                     type == NULL ? "<null>" : type,
+                     session_id == NULL ? "<null>" : session_id,
+                     seq,
+                     line);
+        }
         cJSON_Delete(root);
         return;
     }
@@ -509,10 +830,12 @@ static void caption_handle_json_line(const char *line)
     s_caption_state.last_seq = seq;
 
     if (strcmp(type, "caption_update") == 0) {
+        static const char *speaker_keys[] = {"speakerLabel", "speaker", "speakerName", "speakerId"};
+        static const char *text_keys[] = {"text", "content", "message", "caption"};
         char display_text[CAPTION_TEXT_MAX_LEN];
         const char *line_id = caption_json_get_string(root, "lineId");
-        const char *speaker_label = caption_json_get_string(root, "speakerLabel");
-        const char *text = caption_json_get_string(root, "text");
+        const char *speaker_label = caption_json_get_string_multi(root, speaker_keys, sizeof(speaker_keys) / sizeof(speaker_keys[0]));
+        const char *text = caption_json_get_string_multi(root, text_keys, sizeof(text_keys) / sizeof(text_keys[0]));
         caption_build_display_text(display_text, sizeof(display_text), speaker_label, text);
         caption_copy_string(s_caption_state.current_line_id, sizeof(s_caption_state.current_line_id), line_id);
         caption_copy_string(s_caption_state.live_text, sizeof(s_caption_state.live_text), display_text);
@@ -525,10 +848,12 @@ static void caption_handle_json_line(const char *line)
                  s_caption_state.live_text);
         lvgl_caption_set_live(s_caption_state.live_text);
     } else if (strcmp(type, "caption_commit") == 0) {
+        static const char *speaker_keys[] = {"speakerLabel", "speaker", "speakerName", "speakerId"};
+        static const char *text_keys[] = {"text", "content", "message", "caption"};
         char display_text[CAPTION_TEXT_MAX_LEN];
         const char *line_id = caption_json_get_string(root, "lineId");
-        const char *speaker_label = caption_json_get_string(root, "speakerLabel");
-        const char *text = caption_json_get_string(root, "text");
+        const char *speaker_label = caption_json_get_string_multi(root, speaker_keys, sizeof(speaker_keys) / sizeof(speaker_keys[0]));
+        const char *text = caption_json_get_string_multi(root, text_keys, sizeof(text_keys) / sizeof(text_keys[0]));
         caption_build_display_text(display_text, sizeof(display_text), speaker_label, text);
         caption_copy_string(s_caption_state.current_line_id, sizeof(s_caption_state.current_line_id), line_id);
         caption_copy_string(s_caption_state.committed_text, sizeof(s_caption_state.committed_text), display_text);
@@ -560,7 +885,9 @@ static void caption_handle_json_line(const char *line)
             lvgl_caption_show_error(error_message == NULL ? "字幕接收异常" : error_message);
         } else if (state != NULL && strcmp(state, "started") == 0) {
             s_caption_state.current_line_id[0] = '\0';
+            s_caption_state.committed_text[0] = '\0';
             s_caption_state.live_text[0] = '\0';
+            lvgl_caption_set_committed(NULL);
             lvgl_caption_clear_live();
         } else if (state != NULL && strcmp(state, "stopped") == 0) {
             s_caption_state.current_line_id[0] = '\0';
@@ -568,7 +895,9 @@ static void caption_handle_json_line(const char *line)
             lvgl_caption_clear_live();
         }
     } else {
-        ESP_LOGW(GATTS_TAG, "未知字幕消息类型: %s", type);
+        if (!caption_handle_simple_json(root)) {
+            ESP_LOGW(GATTS_TAG, "未知字幕消息类型: %s", type);
+        }
     }
 
     cJSON_Delete(root);
@@ -597,7 +926,7 @@ static void caption_consume_write_data(uint16_t conn_id, const uint8_t *data, si
                      conn_id,
                      (unsigned int)s_caption_rx.length);
             s_caption_rx.buffer[s_caption_rx.length] = '\0';
-            caption_handle_json_line(s_caption_rx.buffer);
+            caption_dispatch_line(s_caption_rx.buffer);
             caption_reset_rx_buffer(conn_id);
             continue;
         }
@@ -613,6 +942,35 @@ static void caption_consume_write_data(uint16_t conn_id, const uint8_t *data, si
         }
 
         s_caption_rx.buffer[s_caption_rx.length++] = ch;
+    }
+
+    if (s_caption_rx.length > 0) {
+        size_t first_non_space = 0;
+        s_caption_rx.buffer[s_caption_rx.length] = '\0';
+
+        while (first_non_space < s_caption_rx.length &&
+               (s_caption_rx.buffer[first_non_space] == ' ' ||
+                s_caption_rx.buffer[first_non_space] == '\t' ||
+                s_caption_rx.buffer[first_non_space] == '\r' ||
+                s_caption_rx.buffer[first_non_space] == '\n')) {
+            first_non_space++;
+        }
+
+        if (caption_is_complete_json_text(s_caption_rx.buffer)) {
+            ESP_LOGI(GATTS_TAG,
+                     "检测到完整JSON字幕消息(无换行): conn_id=%u, buffered_len=%u",
+                     conn_id,
+                     (unsigned int)s_caption_rx.length);
+            caption_dispatch_line(s_caption_rx.buffer);
+            caption_reset_rx_buffer(conn_id);
+        } else if (first_non_space < s_caption_rx.length && s_caption_rx.buffer[first_non_space] != '{') {
+            ESP_LOGI(GATTS_TAG,
+                     "检测到纯文本字幕消息(无换行): conn_id=%u, buffered_len=%u",
+                     conn_id,
+                     (unsigned int)s_caption_rx.length);
+            caption_dispatch_line(s_caption_rx.buffer);
+            caption_reset_rx_buffer(conn_id);
+        }
     }
 
     ESP_LOGI(GATTS_TAG,
@@ -632,17 +990,15 @@ static void caption_handle_characteristic_write(
         return;
     }
 
-    ESP_LOGI(GATTS_TAG, "========================================");
-    ESP_LOGI(GATTS_TAG, "收到字幕协议数据包 (%s): len=%d", profile_name, param->write.len);
-    ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
     ESP_LOGI(GATTS_TAG,
-             "写入上下文: conn_id=%u handle=%u is_prep=%d need_rsp=%d current_buffer=%u",
+             "收到字幕分片 (%s): conn_id=%u handle=%u len=%u is_prep=%d need_rsp=%d buffered=%u",
+             profile_name,
              param->write.conn_id,
              param->write.handle,
+             (unsigned int)param->write.len,
              param->write.is_prep,
              param->write.need_rsp,
              (unsigned int)s_caption_rx.length);
-    ESP_LOGI(GATTS_TAG, "========================================");
 
     caption_consume_write_data(
         param->write.conn_id,
@@ -744,9 +1100,6 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
     case ESP_GATTS_WRITE_EVT: {
         ESP_LOGI(GATTS_TAG, "Characteristic write, conn_id %d, trans_id %" PRIu32 ", handle %d", param->write.conn_id, param->write.trans_id, param->write.handle);
         if (!param->write.is_prep){
-            ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
-            ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
-            
             caption_handle_characteristic_write(
                 param,
                 gl_profile_tab[PROFILE_A_APP_ID].char_handle,
@@ -927,9 +1280,6 @@ static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
     case ESP_GATTS_WRITE_EVT: {
         ESP_LOGI(GATTS_TAG, "Characteristic write, conn_id %d, trans_id %" PRIu32 ", handle %d", param->write.conn_id, param->write.trans_id, param->write.handle);
         if (!param->write.is_prep){
-            ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
-            ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
-            
             caption_handle_characteristic_write(
                 param,
                 gl_profile_tab[PROFILE_B_APP_ID].char_handle,
@@ -1093,15 +1443,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK( ret );
 
-    // 初始化WiFi并连接到指定的AP
-    ESP_LOGI(GATTS_TAG, "Initializing WiFi connection...");
-    ret = wifi_connect_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(GATTS_TAG, "WiFi connection failed: %s", esp_err_to_name(ret));
-        // 继续运行BLE功能,即使WiFi连接失败
-    } else {
-        ESP_LOGI(GATTS_TAG, "WiFi connection established successfully");
-    }
+    ESP_LOGI(GATTS_TAG, "BLE caption mode active");
 
     // 初始化LVGL和OLED显示屏
     ESP_LOGI(GATTS_TAG, "Initializing LVGL and OLED display...");
@@ -1111,6 +1453,12 @@ void app_main(void)
         return;
     }
     ESP_LOGI(GATTS_TAG, "LVGL and OLED display initialized successfully");
+
+    ret = caption_worker_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(GATTS_TAG, "Caption worker init failed: %s", esp_err_to_name(ret));
+        return;
+    }
 
     #if CONFIG_EXAMPLE_CI_PIPELINE_ID
     memcpy(test_device_name, esp_bluedroid_get_example_name(), ESP_BLE_ADV_NAME_LEN_MAX);

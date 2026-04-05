@@ -19,12 +19,14 @@
 
 #define UI_BG_COLOR_HEX          0x1A1A1A
 #define UI_DIVIDER_COLOR_HEX     0x4A4A4A
+#define UI_TEXT_COMMITTED_HEX    0xB8D3FF
+#define UI_TEXT_LIVE_HEX         0xFFFFFF
+#define UI_TEXT_ERROR_HEX        0xFF8A80
 #define UI_STATUS_BAR_WIDTH      30
 #define UI_DIVIDER_WIDTH         1
 #define UI_VISIBLE_CROP_TOP_DIV  4
 #define UI_DIALOG_GAP            6
 #define UI_TEXT_BUF_LEN          512
-#define UI_LINE_BUF_LEN          640
 
 static const char *TAG = "LVGL_UI";
 
@@ -40,24 +42,16 @@ static lv_obj_t *s_status_sidebar = NULL;
 static lv_obj_t *s_main_text_area = NULL;
 static lv_obj_t *s_dialog_label_top = NULL;
 static lv_obj_t *s_dialog_label_mid = NULL;
-static lv_obj_t *s_dialog_label_bottom = NULL;
-
-static const char *DEFAULT_DIALOG_TOP = "#8AB4F8 已定稿:#等待定稿字幕";
-static const char *DEFAULT_DIALOG_MID = "#FFD54F 实时:#开始监听后显示";
-static const char *DEFAULT_DIALOG_BOTTOM = "#8AB4F8 状态:#等待会话开始";
-
 static void lvgl_task(void *param);
 static void create_smart_glasses_demo_ui(void);
 static lv_obj_t *create_dialog_label(lv_obj_t *parent, lv_coord_t width, const char *text);
 static void normalize_punctuation_to_ascii(const char *src, char *dst, size_t dst_len);
-static void update_label_locked(lv_obj_t *label, const char *text, const char *fallback);
+static void clear_caption_line_locked(lv_obj_t *label);
 static void sanitize_display_text(const char *src, char *dst, size_t dst_len);
 static void set_caption_line_locked(
     lv_obj_t *label,
-    const char *prefix,
     const char *text,
     const char *placeholder);
-static void format_distance(char *buf, size_t buf_len, int distance_meters);
 static bool ensure_mutex(void);
 
 static bool ensure_mutex(void)
@@ -136,60 +130,6 @@ void lvgl_oled_unlock(void)
     }
 }
 
-void lvgl_update_current_road(const char *road_name)
-{
-    if (!s_initialized) {
-        return;
-    }
-    lvgl_oled_lock();
-    update_label_locked(s_dialog_label_top, road_name, DEFAULT_DIALOG_TOP);
-    lvgl_oled_unlock();
-}
-
-void lvgl_update_next_road(const char *road_name)
-{
-    if (!s_initialized) {
-        return;
-    }
-    lvgl_oled_lock();
-    update_label_locked(s_dialog_label_mid, road_name, DEFAULT_DIALOG_MID);
-    lvgl_oled_unlock();
-}
-
-void lvgl_update_next_distance(int distance_meters)
-{
-    if (!s_initialized || s_dialog_label_mid == NULL) {
-        return;
-    }
-    char dist_buf[16];
-    char text_buf[64];
-    format_distance(dist_buf, sizeof(dist_buf), distance_meters);
-    snprintf(text_buf, sizeof(text_buf), "#FFD54F B:#下一个路口%s", dist_buf);
-    lvgl_oled_lock();
-    lv_label_set_text(s_dialog_label_mid, text_buf);
-    lvgl_oled_unlock();
-}
-
-void lvgl_update_remaining_distance(int distance_meters)
-{
-    if (!s_initialized) {
-        return;
-    }
-    char dist_buf[16];
-    char text_buf[64];
-    format_distance(dist_buf, sizeof(dist_buf), distance_meters);
-    snprintf(text_buf, sizeof(text_buf), "#8AB4F8 A:#剩余距离%s", dist_buf);
-    lvgl_oled_lock();
-    if (s_dialog_label_bottom != NULL) {
-        lv_label_set_text(s_dialog_label_bottom, text_buf);
-    } else if (s_dialog_label_top != NULL) {
-        lv_label_set_text(s_dialog_label_top, text_buf);
-    } else if (s_dialog_label_mid != NULL) {
-        lv_label_set_text(s_dialog_label_mid, text_buf);
-    }
-    lvgl_oled_unlock();
-}
-
 void lvgl_update_text(const char *text)
 {
     lvgl_caption_set_live(text);
@@ -203,11 +143,8 @@ void lvgl_caption_set_committed(const char *text)
     }
     ESP_LOGI(TAG, "更新定稿字幕: %s", text == NULL ? "<placeholder>" : text);
     lvgl_oled_lock();
-    set_caption_line_locked(
-        s_dialog_label_top,
-        "#8AB4F8 已定稿:#",
-        text,
-        "等待定稿字幕");
+    lv_obj_set_style_text_color(s_dialog_label_top, lv_color_hex(UI_TEXT_COMMITTED_HEX), 0);
+    set_caption_line_locked(s_dialog_label_top, text, NULL);
     lvgl_oled_unlock();
 }
 
@@ -219,11 +156,8 @@ void lvgl_caption_set_live(const char *text)
     }
     ESP_LOGI(TAG, "更新实时字幕: %s", text == NULL ? "<placeholder>" : text);
     lvgl_oled_lock();
-    set_caption_line_locked(
-        s_dialog_label_mid,
-        "#FFD54F 实时:#",
-        text,
-        "开始监听后显示");
+    lv_obj_set_style_text_color(s_dialog_label_mid, lv_color_hex(UI_TEXT_LIVE_HEX), 0);
+    set_caption_line_locked(s_dialog_label_mid, text, NULL);
     lvgl_oled_unlock();
 }
 
@@ -235,7 +169,8 @@ void lvgl_caption_clear_live(void)
     }
     ESP_LOGI(TAG, "清空实时字幕显示");
     lvgl_oled_lock();
-    lv_label_set_text(s_dialog_label_mid, "#FFD54F 实时:#");
+    lv_obj_set_style_text_color(s_dialog_label_mid, lv_color_hex(UI_TEXT_LIVE_HEX), 0);
+    clear_caption_line_locked(s_dialog_label_mid);
     lvgl_oled_unlock();
 }
 
@@ -247,11 +182,8 @@ void lvgl_caption_show_error(const char *text)
     }
     ESP_LOGE(TAG, "显示字幕错误提示: %s", text == NULL ? "<placeholder>" : text);
     lvgl_oled_lock();
-    set_caption_line_locked(
-        s_dialog_label_mid,
-        "#FF8A80 错误:#",
-        text,
-        "字幕接收异常");
+    lv_obj_set_style_text_color(s_dialog_label_mid, lv_color_hex(UI_TEXT_ERROR_HEX), 0);
+    set_caption_line_locked(s_dialog_label_mid, text, "字幕接收异常");
     lvgl_oled_unlock();
 }
 
@@ -276,7 +208,10 @@ static lv_obj_t *create_dialog_label(lv_obj_t *parent, lv_coord_t width, const c
     lv_obj_set_style_text_font(label, &font_18, 0);
     lv_obj_set_style_text_color(label, lv_color_white(), 0);
     lv_obj_set_style_text_line_space(label, 3, 0);
-    lv_label_set_text(label, text);
+    lv_label_set_text(label, text == NULL ? "" : text);
+    if (text == NULL || text[0] == '\0') {
+        lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
+    }
     return label;
 }
 
@@ -331,10 +266,6 @@ static void create_smart_glasses_demo_ui(void)
     lv_label_set_text(icon_battery, LV_SYMBOL_BATTERY_FULL);
     lv_obj_set_style_text_color(icon_battery, lv_color_white(), 0);
 
-    lv_obj_t *icon_audio = lv_label_create(s_status_sidebar);
-    lv_label_set_text(icon_audio, LV_SYMBOL_AUDIO);
-    lv_obj_set_style_text_color(icon_audio, lv_color_white(), 0);
-
     /* 分割线：只覆盖可视窗高度 */
     if (divider_width > 0) {
         lv_obj_t *divider = lv_obj_create(scr);
@@ -345,7 +276,7 @@ static void create_smart_glasses_demo_ui(void)
         lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
     }
 
-    /* 右侧主文本区：限定在中间可视窗，仅放两句 A/B */
+    /* 右侧主文本区：限定在中间可视窗，保留定稿 + 实时两行结构 */
     s_main_text_area = lv_obj_create(scr);
     lv_obj_remove_style_all(s_main_text_area);
     lv_obj_set_size(s_main_text_area, main_width, visible_height);
@@ -360,35 +291,23 @@ static void create_smart_glasses_demo_ui(void)
     lv_obj_set_flex_flow(s_main_text_area, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_main_text_area, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    s_dialog_label_top = create_dialog_label(s_main_text_area, dialog_text_width, DEFAULT_DIALOG_TOP);
-    s_dialog_label_mid = create_dialog_label(s_main_text_area, dialog_text_width, DEFAULT_DIALOG_MID);
-    s_dialog_label_bottom = NULL;
-
+    s_dialog_label_top = create_dialog_label(s_main_text_area, dialog_text_width, "");
+    lv_obj_set_style_text_color(s_dialog_label_top, lv_color_hex(UI_TEXT_COMMITTED_HEX), 0);
+    s_dialog_label_mid = create_dialog_label(s_main_text_area, dialog_text_width, "");
+    lv_obj_set_style_text_color(s_dialog_label_mid, lv_color_hex(UI_TEXT_LIVE_HEX), 0);
     ESP_LOGI(TAG, "UI布局: %dx%d, 可视窗Y:%d H:%d, 侧边栏:%d, 主区:%d, 文本宽:%d",
              (int)width, (int)height, (int)visible_top, (int)visible_height,
              (int)status_width, (int)main_width, (int)dialog_text_width);
 }
 
-static void update_label_locked(lv_obj_t *label, const char *text, const char *fallback)
+static void clear_caption_line_locked(lv_obj_t *label)
 {
-    static char normalized_buf[UI_TEXT_BUF_LEN];
-    const char *src = NULL;
-
     if (label == NULL) {
         return;
     }
 
-    if (text != NULL && text[0] != '\0') {
-        src = text;
-    } else if (fallback != NULL) {
-        src = fallback;
-    } else {
-        lv_label_set_text(label, "");
-        return;
-    }
-
-    normalize_punctuation_to_ascii(src, normalized_buf, sizeof(normalized_buf));
-    lv_label_set_text(label, normalized_buf);
+    lv_label_set_text(label, "");
+    lv_obj_add_flag(label, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void sanitize_display_text(const char *src, char *dst, size_t dst_len)
@@ -426,15 +345,13 @@ static void sanitize_display_text(const char *src, char *dst, size_t dst_len)
 
 static void set_caption_line_locked(
     lv_obj_t *label,
-    const char *prefix,
     const char *text,
     const char *placeholder)
 {
     char body_buf[UI_TEXT_BUF_LEN];
-    char line_buf[UI_LINE_BUF_LEN];
     const char *body = placeholder;
 
-    if (label == NULL || prefix == NULL) {
+    if (label == NULL) {
         return;
     }
 
@@ -445,9 +362,14 @@ static void set_caption_line_locked(
         }
     }
 
-    snprintf(line_buf, sizeof(line_buf), "%s%s", prefix, body == NULL ? "" : body);
-    ESP_LOGI(TAG, "应用到 LVGL label: prefix=%s body=%s", prefix, body == NULL ? "<null>" : body);
-    lv_label_set_text(label, line_buf);
+    if (body == NULL || body[0] == '\0') {
+        clear_caption_line_locked(label);
+        return;
+    }
+
+    ESP_LOGI(TAG, "应用到 LVGL label: %s", body);
+    lv_label_set_text(label, body);
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void normalize_punctuation_to_ascii(const char *src, char *dst, size_t dst_len)
@@ -508,19 +430,5 @@ static void normalize_punctuation_to_ascii(const char *src, char *dst, size_t ds
     }
 
     dst[di] = '\0';
-}
-
-static void format_distance(char *buf, size_t buf_len, int distance_meters)
-{
-    if (distance_meters < 0) {
-        distance_meters = 0;
-    }
-
-    if (distance_meters >= 1000) {
-        float km = distance_meters / 1000.0f;
-        snprintf(buf, buf_len, "%.1fkm", km);
-    } else {
-        snprintf(buf, buf_len, "%dm", distance_meters);
-    }
 }
 

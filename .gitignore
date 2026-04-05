@@ -2,10 +2,15 @@ build/
 managed_components/
 .vscode/
 
-main/project_local_config.private.h
-
 sdkconfig.old
 sdkconfig.local
 sdkconfig.local.defaults
 
 build_output.txt
+
+# ESP-IDF build artifacts copied out of build/
+*.bin
+*.elf
+*.map
+*.lst
+flasher_args.json
