@@ -13,4 +13,8 @@ void lvgl_update_next_road(const char *road_name);
 void lvgl_update_next_distance(int distance_meters);
 void lvgl_update_remaining_distance(int distance_meters);
 void lvgl_update_text(const char *text);
+void lvgl_caption_set_committed(const char *text);
+void lvgl_caption_set_live(const char *text);
+void lvgl_caption_clear_live(void);
+void lvgl_caption_show_error(const char *text);
 

@@ -32,6 +32,7 @@
 #include "esp_bt_main.h"
 #include "esp_bt_device.h"
 #include "esp_gatt_common_api.h"
+#include "cJSON.h"
 
 #include "sdkconfig.h"
 #include "wifi_connect.h"
@@ -200,8 +201,54 @@ typedef struct {
 static prepare_type_env_t a_prepare_write_env;
 static prepare_type_env_t b_prepare_write_env;
 
+#define CAPTION_RX_BUFFER_SIZE        2048
+#define CAPTION_SESSION_ID_MAX_LEN    96
+#define CAPTION_LINE_ID_MAX_LEN       96
+#define CAPTION_TEXT_MAX_LEN          512
+
+typedef struct {
+    bool active;
+    uint16_t conn_id;
+    size_t length;
+    char buffer[CAPTION_RX_BUFFER_SIZE];
+} caption_rx_buffer_t;
+
+typedef struct {
+    bool active;
+    char session_id[CAPTION_SESSION_ID_MAX_LEN];
+    int last_seq;
+    char current_line_id[CAPTION_LINE_ID_MAX_LEN];
+    char committed_text[CAPTION_TEXT_MAX_LEN];
+    char live_text[CAPTION_TEXT_MAX_LEN];
+} caption_state_t;
+
+static caption_rx_buffer_t s_caption_rx = {
+    .active = false,
+    .conn_id = 0,
+    .length = 0,
+    .buffer = {0},
+};
+
+static caption_state_t s_caption_state = {
+    .active = false,
+    .session_id = {0},
+    .last_seq = -1,
+    .current_line_id = {0},
+    .committed_text = {0},
+    .live_text = {0},
+};
+
 void example_write_event_env(esp_gatt_if_t gatts_if, prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
 void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble_gatts_cb_param_t *param);
+static void caption_reset_rx_buffer(uint16_t conn_id);
+static void caption_reset_state(bool clear_session);
+static void caption_consume_write_data(uint16_t conn_id, const uint8_t *data, size_t len);
+static void caption_handle_json_line(const char *line);
+static void caption_copy_string(char *dst, size_t dst_len, const char *src);
+static void caption_build_display_text(char *dst, size_t dst_len, const char *speaker_label, const char *text);
+static const char *caption_json_get_string(cJSON *root, const char *key);
+static int caption_json_get_int(cJSON *root, const char *key, int fallback);
+static void caption_handle_characteristic_write(esp_ble_gatts_cb_param_t *param, uint16_t char_handle, const char *profile_name);
 
 static void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param)
 {
@@ -327,6 +374,282 @@ void example_exec_write_event_env(prepare_type_env_t *prepare_write_env, esp_ble
     prepare_write_env->prepare_len = 0;
 }
 
+static void caption_reset_rx_buffer(uint16_t conn_id)
+{
+    ESP_LOGI(GATTS_TAG, "重置字幕接收缓存: conn_id=%u, previous_len=%u",
+             conn_id,
+             (unsigned int)s_caption_rx.length);
+    s_caption_rx.active = true;
+    s_caption_rx.conn_id = conn_id;
+    s_caption_rx.length = 0;
+    s_caption_rx.buffer[0] = '\0';
+}
+
+static void caption_reset_state(bool clear_session)
+{
+    ESP_LOGI(GATTS_TAG,
+             "重置字幕状态: clear_session=%d, session=%s, last_seq=%d, live_len=%u, committed_len=%u",
+             clear_session,
+             s_caption_state.session_id[0] == '\0' ? "<empty>" : s_caption_state.session_id,
+             s_caption_state.last_seq,
+             (unsigned int)strlen(s_caption_state.live_text),
+             (unsigned int)strlen(s_caption_state.committed_text));
+    s_caption_state.active = false;
+    s_caption_state.last_seq = -1;
+    s_caption_state.current_line_id[0] = '\0';
+    s_caption_state.live_text[0] = '\0';
+    if (clear_session) {
+        s_caption_state.session_id[0] = '\0';
+        s_caption_state.committed_text[0] = '\0';
+    }
+}
+
+static void caption_copy_string(char *dst, size_t dst_len, const char *src)
+{
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    strncpy(dst, src, dst_len - 1);
+    dst[dst_len - 1] = '\0';
+}
+
+static void caption_build_display_text(
+    char *dst,
+    size_t dst_len,
+    const char *speaker_label,
+    const char *text)
+{
+    const char *safe_text = text == NULL ? "" : text;
+
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+
+    if (speaker_label != NULL && speaker_label[0] != '\0') {
+        snprintf(dst, dst_len, "%s: %s", speaker_label, safe_text);
+    } else {
+        snprintf(dst, dst_len, "%s", safe_text);
+    }
+}
+
+static const char *caption_json_get_string(cJSON *root, const char *key)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsString(item) && item->valuestring != NULL) {
+        return item->valuestring;
+    }
+    return NULL;
+}
+
+static int caption_json_get_int(cJSON *root, const char *key, int fallback)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (cJSON_IsNumber(item)) {
+        return item->valueint;
+    }
+    return fallback;
+}
+
+static void caption_handle_json_line(const char *line)
+{
+    if (line == NULL || line[0] == '\0') {
+        ESP_LOGW(GATTS_TAG, "忽略空的字幕消息行");
+        return;
+    }
+
+    ESP_LOGI(GATTS_TAG, "收到完整字幕消息行: len=%u, raw=%s",
+             (unsigned int)strlen(line), line);
+    cJSON *root = cJSON_Parse(line);
+    if (root == NULL) {
+        const char *error_ptr = cJSON_GetErrorPtr();
+        ESP_LOGE(GATTS_TAG, "字幕协议解析失败: error_at=%s raw=%s",
+                 error_ptr == NULL ? "<unknown>" : error_ptr,
+                 line);
+        return;
+    }
+
+    const char *type = caption_json_get_string(root, "type");
+    const char *session_id = caption_json_get_string(root, "sessionId");
+    const int seq = caption_json_get_int(root, "seq", -1);
+
+    if (type == NULL || session_id == NULL || seq < 0) {
+        ESP_LOGE(GATTS_TAG,
+                 "字幕协议缺少必要字段: type=%s sessionId=%s seq=%d raw=%s",
+                 type == NULL ? "<null>" : type,
+                 session_id == NULL ? "<null>" : session_id,
+                 seq,
+                 line);
+        cJSON_Delete(root);
+        return;
+    }
+
+    if (!s_caption_state.active || strcmp(s_caption_state.session_id, session_id) != 0) {
+        ESP_LOGW(GATTS_TAG,
+                 "检测到新的字幕会话: old_session=%s new_session=%s",
+                 s_caption_state.session_id[0] == '\0' ? "<empty>" : s_caption_state.session_id,
+                 session_id);
+        caption_reset_state(true);
+        caption_copy_string(s_caption_state.session_id, sizeof(s_caption_state.session_id), session_id);
+        s_caption_state.active = true;
+        lvgl_caption_set_committed(NULL);
+        lvgl_caption_clear_live();
+    }
+
+    if (seq <= s_caption_state.last_seq) {
+        ESP_LOGW(GATTS_TAG, "丢弃旧字幕消息: seq=%d last_seq=%d", seq, s_caption_state.last_seq);
+        cJSON_Delete(root);
+        return;
+    }
+    s_caption_state.last_seq = seq;
+
+    if (strcmp(type, "caption_update") == 0) {
+        char display_text[CAPTION_TEXT_MAX_LEN];
+        const char *line_id = caption_json_get_string(root, "lineId");
+        const char *speaker_label = caption_json_get_string(root, "speakerLabel");
+        const char *text = caption_json_get_string(root, "text");
+        caption_build_display_text(display_text, sizeof(display_text), speaker_label, text);
+        caption_copy_string(s_caption_state.current_line_id, sizeof(s_caption_state.current_line_id), line_id);
+        caption_copy_string(s_caption_state.live_text, sizeof(s_caption_state.live_text), display_text);
+        ESP_LOGI(GATTS_TAG,
+                 "应用实时字幕: session=%s seq=%d line_id=%s speaker=%s text=%s",
+                 s_caption_state.session_id,
+                 seq,
+                 line_id == NULL ? "<null>" : line_id,
+                 speaker_label == NULL ? "<none>" : speaker_label,
+                 s_caption_state.live_text);
+        lvgl_caption_set_live(s_caption_state.live_text);
+    } else if (strcmp(type, "caption_commit") == 0) {
+        char display_text[CAPTION_TEXT_MAX_LEN];
+        const char *line_id = caption_json_get_string(root, "lineId");
+        const char *speaker_label = caption_json_get_string(root, "speakerLabel");
+        const char *text = caption_json_get_string(root, "text");
+        caption_build_display_text(display_text, sizeof(display_text), speaker_label, text);
+        caption_copy_string(s_caption_state.current_line_id, sizeof(s_caption_state.current_line_id), line_id);
+        caption_copy_string(s_caption_state.committed_text, sizeof(s_caption_state.committed_text), display_text);
+        s_caption_state.live_text[0] = '\0';
+        ESP_LOGI(GATTS_TAG,
+                 "应用定稿字幕: session=%s seq=%d line_id=%s speaker=%s text=%s",
+                 s_caption_state.session_id,
+                 seq,
+                 line_id == NULL ? "<null>" : line_id,
+                 speaker_label == NULL ? "<none>" : speaker_label,
+                 s_caption_state.committed_text);
+        lvgl_caption_set_committed(s_caption_state.committed_text);
+        lvgl_caption_clear_live();
+    } else if (strcmp(type, "caption_clear") == 0) {
+        s_caption_state.current_line_id[0] = '\0';
+        s_caption_state.live_text[0] = '\0';
+        ESP_LOGI(GATTS_TAG, "清空实时字幕: session=%s seq=%d", s_caption_state.session_id, seq);
+        lvgl_caption_clear_live();
+    } else if (strcmp(type, "session_state") == 0) {
+        const char *state = caption_json_get_string(root, "state");
+        const char *error_message = caption_json_get_string(root, "errorMessage");
+        ESP_LOGI(GATTS_TAG,
+                 "应用会话状态: session=%s seq=%d state=%s error=%s",
+                 s_caption_state.session_id,
+                 seq,
+                 state == NULL ? "<null>" : state,
+                 error_message == NULL ? "<none>" : error_message);
+        if (state != NULL && strcmp(state, "error") == 0) {
+            lvgl_caption_show_error(error_message == NULL ? "字幕接收异常" : error_message);
+        } else if (state != NULL && strcmp(state, "started") == 0) {
+            s_caption_state.current_line_id[0] = '\0';
+            s_caption_state.live_text[0] = '\0';
+            lvgl_caption_clear_live();
+        } else if (state != NULL && strcmp(state, "stopped") == 0) {
+            s_caption_state.current_line_id[0] = '\0';
+            s_caption_state.live_text[0] = '\0';
+            lvgl_caption_clear_live();
+        }
+    } else {
+        ESP_LOGW(GATTS_TAG, "未知字幕消息类型: %s", type);
+    }
+
+    cJSON_Delete(root);
+}
+
+static void caption_consume_write_data(uint16_t conn_id, const uint8_t *data, size_t len)
+{
+    if (data == NULL || len == 0) {
+        return;
+    }
+
+    if (!s_caption_rx.active || s_caption_rx.conn_id != conn_id) {
+        caption_reset_rx_buffer(conn_id);
+    }
+
+    for (size_t i = 0; i < len; ++i) {
+        const char ch = (char)data[i];
+
+        if (ch == '\r') {
+            continue;
+        }
+
+        if (ch == '\n') {
+            ESP_LOGI(GATTS_TAG,
+                     "检测到字幕消息结束符: conn_id=%u, buffered_len=%u",
+                     conn_id,
+                     (unsigned int)s_caption_rx.length);
+            s_caption_rx.buffer[s_caption_rx.length] = '\0';
+            caption_handle_json_line(s_caption_rx.buffer);
+            caption_reset_rx_buffer(conn_id);
+            continue;
+        }
+
+        if (s_caption_rx.length + 1 >= CAPTION_RX_BUFFER_SIZE) {
+            ESP_LOGE(GATTS_TAG,
+                     "字幕接收缓存溢出，丢弃当前消息: conn_id=%u incoming_len=%u current_len=%u",
+                     conn_id,
+                     (unsigned int)len,
+                     (unsigned int)s_caption_rx.length);
+            caption_reset_rx_buffer(conn_id);
+            continue;
+        }
+
+        s_caption_rx.buffer[s_caption_rx.length++] = ch;
+    }
+
+    ESP_LOGI(GATTS_TAG,
+             "字幕分片已写入缓存: conn_id=%u chunk_len=%u buffered_len=%u mtu=%u",
+             conn_id,
+             (unsigned int)len,
+             (unsigned int)s_caption_rx.length,
+             local_mtu);
+}
+
+static void caption_handle_characteristic_write(
+    esp_ble_gatts_cb_param_t *param,
+    uint16_t char_handle,
+    const char *profile_name)
+{
+    if (param == NULL || char_handle != param->write.handle) {
+        return;
+    }
+
+    ESP_LOGI(GATTS_TAG, "========================================");
+    ESP_LOGI(GATTS_TAG, "收到字幕协议数据包 (%s): len=%d", profile_name, param->write.len);
+    ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
+    ESP_LOGI(GATTS_TAG,
+             "写入上下文: conn_id=%u handle=%u is_prep=%d need_rsp=%d current_buffer=%u",
+             param->write.conn_id,
+             param->write.handle,
+             param->write.is_prep,
+             param->write.need_rsp,
+             (unsigned int)s_caption_rx.length);
+    ESP_LOGI(GATTS_TAG, "========================================");
+
+    caption_consume_write_data(
+        param->write.conn_id,
+        param->write.value,
+        param->write.len);
+}
+
 static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble_gatts_cb_param_t *param) {
     switch (event) {
     case ESP_GATTS_REG_EVT:
@@ -424,21 +747,10 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
             ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
             ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
             
-            // 处理特征值写入 - 直接将蓝牙文本显示到屏幕
-            if (gl_profile_tab[PROFILE_A_APP_ID].char_handle == param->write.handle) {
-                // 创建null结尾的字符串
-                char text_str[param->write.len + 1];
-                memcpy(text_str, param->write.value, param->write.len);
-                text_str[param->write.len] = '\0';
-                
-                ESP_LOGI(GATTS_TAG, "========================================");
-                ESP_LOGI(GATTS_TAG, "收到文本数据包 (Profile A):");
-                ESP_LOGI(GATTS_TAG, "长度: %d 字节", param->write.len);
-                ESP_LOGI(GATTS_TAG, "内容: %s", text_str);
-                ESP_LOGI(GATTS_TAG, "========================================");
-
-                lvgl_update_text(text_str);
-            }
+            caption_handle_characteristic_write(
+                param,
+                gl_profile_tab[PROFILE_A_APP_ID].char_handle,
+                "Profile A");
             
             // 处理描述符写入 - 启用/禁用通知
             if (gl_profile_tab[PROFILE_A_APP_ID].descr_handle == param->write.handle && param->write.len == 2){
@@ -558,6 +870,7 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
         ESP_LOGI(GATTS_TAG, "Connected, conn_id %u, remote "ESP_BD_ADDR_STR"",
                  param->connect.conn_id, ESP_BD_ADDR_HEX(param->connect.remote_bda));
         gl_profile_tab[PROFILE_A_APP_ID].conn_id = param->connect.conn_id;
+        caption_reset_rx_buffer(param->connect.conn_id);
         //start sent the update connection parameters to the peer device.
         esp_ble_gap_update_conn_params(&conn_params);
         break;
@@ -567,6 +880,8 @@ static void gatts_profile_a_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
                  ESP_BD_ADDR_HEX(param->disconnect.remote_bda), param->disconnect.reason);
         esp_ble_gap_start_advertising(&adv_params);
         local_mtu = 23; // Reset MTU for a single connection
+        caption_reset_rx_buffer(0);
+        lvgl_caption_clear_live();
         break;
     case ESP_GATTS_CONF_EVT:
         ESP_LOGI(GATTS_TAG, "Confirm receive, status %d, attr_handle %d", param->conf.status, param->conf.handle);
@@ -615,21 +930,10 @@ static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
             ESP_LOGI(GATTS_TAG, "value len %d, value ", param->write.len);
             ESP_LOG_BUFFER_HEX(GATTS_TAG, param->write.value, param->write.len);
             
-            // 处理特征值写入 - 直接将蓝牙文本显示到屏幕 (Profile B)
-            if (gl_profile_tab[PROFILE_B_APP_ID].char_handle == param->write.handle) {
-                // 创建null结尾的字符串
-                char text_str[param->write.len + 1];
-                memcpy(text_str, param->write.value, param->write.len);
-                text_str[param->write.len] = '\0';
-                
-                ESP_LOGI(GATTS_TAG, "========================================");
-                ESP_LOGI(GATTS_TAG, "收到文本数据包 (Profile B):");
-                ESP_LOGI(GATTS_TAG, "长度: %d 字节", param->write.len);
-                ESP_LOGI(GATTS_TAG, "内容: %s", text_str);
-                ESP_LOGI(GATTS_TAG, "========================================");
-
-                lvgl_update_text(text_str);
-            }
+            caption_handle_characteristic_write(
+                param,
+                gl_profile_tab[PROFILE_B_APP_ID].char_handle,
+                "Profile B");
             
             // 处理描述符写入 - 启用/禁用通知
             if (gl_profile_tab[PROFILE_B_APP_ID].descr_handle == param->write.handle && param->write.len == 2){
@@ -726,6 +1030,7 @@ static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
         ESP_LOGI(GATTS_TAG, "Connected, conn_id %d, remote "ESP_BD_ADDR_STR"",
                  param->connect.conn_id, ESP_BD_ADDR_HEX(param->connect.remote_bda));
         gl_profile_tab[PROFILE_B_APP_ID].conn_id = param->connect.conn_id;
+        caption_reset_rx_buffer(param->connect.conn_id);
         break;
     case ESP_GATTS_CONF_EVT:
         ESP_LOGI(GATTS_TAG, "Confirm receive, status %d, attr_handle %d", param->conf.status, param->conf.handle);
@@ -734,6 +1039,9 @@ static void gatts_profile_b_event_handler(esp_gatts_cb_event_t event, esp_gatt_i
         }
     break;
     case ESP_GATTS_DISCONNECT_EVT:
+        caption_reset_rx_buffer(0);
+        lvgl_caption_clear_live();
+        break;
     case ESP_GATTS_OPEN_EVT:
     case ESP_GATTS_CANCEL_OPEN_EVT:
     case ESP_GATTS_CLOSE_EVT:

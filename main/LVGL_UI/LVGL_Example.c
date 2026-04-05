@@ -24,6 +24,7 @@
 #define UI_VISIBLE_CROP_TOP_DIV  4
 #define UI_DIALOG_GAP            6
 #define UI_TEXT_BUF_LEN          512
+#define UI_LINE_BUF_LEN          640
 
 static const char *TAG = "LVGL_UI";
 
@@ -41,15 +42,21 @@ static lv_obj_t *s_dialog_label_top = NULL;
 static lv_obj_t *s_dialog_label_mid = NULL;
 static lv_obj_t *s_dialog_label_bottom = NULL;
 
-static const char *DEFAULT_DIALOG_TOP = "#8AB4F8 A:#你好!很高兴见到你,我们好久没见了.";
-static const char *DEFAULT_DIALOG_MID = "#FFD54F B:#是啊,很久了!这个眼镜真方便,可以实时看文字.";
-static const char *DEFAULT_DIALOG_BOTTOM = "#8AB4F8 A:#真的吗?那太好了,日常交流方便多了.";
+static const char *DEFAULT_DIALOG_TOP = "#8AB4F8 已定稿:#等待定稿字幕";
+static const char *DEFAULT_DIALOG_MID = "#FFD54F 实时:#开始监听后显示";
+static const char *DEFAULT_DIALOG_BOTTOM = "#8AB4F8 状态:#等待会话开始";
 
 static void lvgl_task(void *param);
 static void create_smart_glasses_demo_ui(void);
 static lv_obj_t *create_dialog_label(lv_obj_t *parent, lv_coord_t width, const char *text);
 static void normalize_punctuation_to_ascii(const char *src, char *dst, size_t dst_len);
 static void update_label_locked(lv_obj_t *label, const char *text, const char *fallback);
+static void sanitize_display_text(const char *src, char *dst, size_t dst_len);
+static void set_caption_line_locked(
+    lv_obj_t *label,
+    const char *prefix,
+    const char *text,
+    const char *placeholder);
 static void format_distance(char *buf, size_t buf_len, int distance_meters);
 static bool ensure_mutex(void);
 
@@ -185,15 +192,66 @@ void lvgl_update_remaining_distance(int distance_meters)
 
 void lvgl_update_text(const char *text)
 {
-    if (!s_initialized) {
+    lvgl_caption_set_live(text);
+}
+
+void lvgl_caption_set_committed(const char *text)
+{
+    if (!s_initialized || s_dialog_label_top == NULL) {
+        ESP_LOGW(TAG, "忽略定稿字幕更新，界面尚未初始化");
         return;
     }
+    ESP_LOGI(TAG, "更新定稿字幕: %s", text == NULL ? "<placeholder>" : text);
     lvgl_oled_lock();
-    if (s_dialog_label_bottom != NULL) {
-        update_label_locked(s_dialog_label_bottom, text, DEFAULT_DIALOG_BOTTOM);
-    } else {
-        update_label_locked(s_dialog_label_mid, text, DEFAULT_DIALOG_MID);
+    set_caption_line_locked(
+        s_dialog_label_top,
+        "#8AB4F8 已定稿:#",
+        text,
+        "等待定稿字幕");
+    lvgl_oled_unlock();
+}
+
+void lvgl_caption_set_live(const char *text)
+{
+    if (!s_initialized || s_dialog_label_mid == NULL) {
+        ESP_LOGW(TAG, "忽略实时字幕更新，界面尚未初始化");
+        return;
     }
+    ESP_LOGI(TAG, "更新实时字幕: %s", text == NULL ? "<placeholder>" : text);
+    lvgl_oled_lock();
+    set_caption_line_locked(
+        s_dialog_label_mid,
+        "#FFD54F 实时:#",
+        text,
+        "开始监听后显示");
+    lvgl_oled_unlock();
+}
+
+void lvgl_caption_clear_live(void)
+{
+    if (!s_initialized || s_dialog_label_mid == NULL) {
+        ESP_LOGW(TAG, "忽略清空实时字幕，界面尚未初始化");
+        return;
+    }
+    ESP_LOGI(TAG, "清空实时字幕显示");
+    lvgl_oled_lock();
+    lv_label_set_text(s_dialog_label_mid, "#FFD54F 实时:#");
+    lvgl_oled_unlock();
+}
+
+void lvgl_caption_show_error(const char *text)
+{
+    if (!s_initialized || s_dialog_label_mid == NULL) {
+        ESP_LOGW(TAG, "忽略错误提示更新，界面尚未初始化");
+        return;
+    }
+    ESP_LOGE(TAG, "显示字幕错误提示: %s", text == NULL ? "<placeholder>" : text);
+    lvgl_oled_lock();
+    set_caption_line_locked(
+        s_dialog_label_mid,
+        "#FF8A80 错误:#",
+        text,
+        "字幕接收异常");
     lvgl_oled_unlock();
 }
 
@@ -331,6 +389,65 @@ static void update_label_locked(lv_obj_t *label, const char *text, const char *f
 
     normalize_punctuation_to_ascii(src, normalized_buf, sizeof(normalized_buf));
     lv_label_set_text(label, normalized_buf);
+}
+
+static void sanitize_display_text(const char *src, char *dst, size_t dst_len)
+{
+    static char normalized_buf[UI_TEXT_BUF_LEN];
+    size_t di = 0;
+
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+
+    normalize_punctuation_to_ascii(src, normalized_buf, sizeof(normalized_buf));
+
+    for (size_t si = 0; normalized_buf[si] != '\0' && di + 1 < dst_len; ++si) {
+        const char ch = normalized_buf[si];
+        if (ch == '#') {
+            dst[di++] = '/';
+            continue;
+        }
+        if (ch == '\r' || ch == '\n') {
+            if (di == 0 || dst[di - 1] == ' ') {
+                continue;
+            }
+            dst[di++] = ' ';
+            continue;
+        }
+        dst[di++] = ch;
+    }
+
+    while (di > 0 && dst[di - 1] == ' ') {
+        di--;
+    }
+    dst[di] = '\0';
+}
+
+static void set_caption_line_locked(
+    lv_obj_t *label,
+    const char *prefix,
+    const char *text,
+    const char *placeholder)
+{
+    char body_buf[UI_TEXT_BUF_LEN];
+    char line_buf[UI_LINE_BUF_LEN];
+    const char *body = placeholder;
+
+    if (label == NULL || prefix == NULL) {
+        return;
+    }
+
+    if (text != NULL && text[0] != '\0') {
+        sanitize_display_text(text, body_buf, sizeof(body_buf));
+        if (body_buf[0] != '\0') {
+            body = body_buf;
+        }
+    }
+
+    snprintf(line_buf, sizeof(line_buf), "%s%s", prefix, body == NULL ? "" : body);
+    ESP_LOGI(TAG, "应用到 LVGL label: prefix=%s body=%s", prefix, body == NULL ? "<null>" : body);
+    lv_label_set_text(label, line_buf);
 }
 
 static void normalize_punctuation_to_ascii(const char *src, char *dst, size_t dst_len)
